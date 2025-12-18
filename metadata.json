@@ -1,0 +1,5 @@
+{
+  "name": "Gemini Vox",
+  "description": "A beautiful, next-generation Text-to-Speech application powered by Gemini 2.5 Flash. Customize voices, styles, and emotions with ease.",
+  "requestFramePermissions": []
+}
