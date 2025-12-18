@@ -1,18 +1,27 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Mic, Play, Pause, Download, Volume2, Sparkles, Wand2, Loader2, Music4 } from 'lucide-react';
+import { Mic, Play, Pause, Download, Volume2, Sparkles, Wand2, Loader2, Music4, Users, User, ArrowRightLeft } from 'lucide-react';
 import { VOICES, STYLE_PRESETS, SAMPLE_RATE } from './constants';
-import { GeneratedAudio, TTSConfig } from './types';
+import { GeneratedAudio, SpeakerConfig } from './types';
 import { generateSpeech } from './services/geminiService';
 import { decodeAudioData, audioBufferToWav } from './utils/audioUtils';
 import Visualizer from './components/Visualizer';
 import { HistoryItem } from './components/HistoryItem';
 
 const App: React.FC = () => {
+  // Mode State
+  const [mode, setMode] = useState<'single' | 'multi'>('single');
+
   // Config State
   const [text, setText] = useState('');
+  
+  // Single Mode State
   const [voice, setVoice] = useState(VOICES[0].name);
   const [stylePrompt, setStylePrompt] = useState('Normal');
   const [customStyle, setCustomStyle] = useState('');
+
+  // Multi Mode State
+  const [speaker1, setSpeaker1] = useState<SpeakerConfig>({ name: 'Joe', voice: 'Puck' });
+  const [speaker2, setSpeaker2] = useState<SpeakerConfig>({ name: 'Jane', voice: 'Kore' });
   
   // App State
   const [isGenerating, setIsGenerating] = useState(false);
@@ -27,7 +36,7 @@ const App: React.FC = () => {
   const analyserRef = useRef<AnalyserNode | null>(null);
   const gainNodeRef = useRef<GainNode | null>(null);
 
-  // Initialize Audio Context on user interaction (to adhere to browser policies)
+  // Initialize Audio Context
   const initAudioContext = useCallback(() => {
     if (!audioContextRef.current) {
       audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({
@@ -50,24 +59,36 @@ const App: React.FC = () => {
 
     try {
       const activeStyle = stylePrompt === 'Custom' ? customStyle : stylePrompt;
-      const base64Data = await generateSpeech(text, voice, activeStyle);
+      
+      const base64Data = await generateSpeech({
+        text,
+        mode,
+        voiceName: voice,
+        stylePrompt: activeStyle,
+        speakers: [speaker1, speaker2]
+      });
 
       if (audioContextRef.current) {
         const buffer = await decodeAudioData(base64Data, audioContextRef.current, SAMPLE_RATE);
         
+        // Determine display voice label
+        const voiceLabel = mode === 'single' 
+          ? voice 
+          : `Duo: ${speaker1.name} & ${speaker2.name}`;
+
         const newItem: GeneratedAudio = {
           id: Date.now().toString(),
           text,
-          voice,
-          style: activeStyle,
+          voice: voiceLabel,
+          style: mode === 'single' ? activeStyle : 'Conversation',
           timestamp: Date.now(),
           audioBuffer: buffer,
           base64: base64Data,
           duration: buffer.duration,
+          mode
         };
 
         setHistory(prev => [newItem, ...prev]);
-        // Auto play the new item
         playAudio(newItem);
       }
     } catch (err: any) {
@@ -82,7 +103,7 @@ const App: React.FC = () => {
       try {
         sourceNodeRef.current.stop();
       } catch (e) {
-        // ignore if already stopped
+        // ignore
       }
       sourceNodeRef.current = null;
     }
@@ -93,7 +114,6 @@ const App: React.FC = () => {
     initAudioContext();
     if (!audioContextRef.current || !item.audioBuffer || !analyserRef.current || !gainNodeRef.current) return;
 
-    // Stop currently playing
     if (activeId === item.id && isPlaying) {
       stopAudio();
       return;
@@ -103,7 +123,6 @@ const App: React.FC = () => {
     const source = audioContextRef.current.createBufferSource();
     source.buffer = item.audioBuffer;
     
-    // Connect nodes: Source -> Analyser -> Gain -> Destination
     source.connect(analyserRef.current);
     analyserRef.current.connect(gainNodeRef.current);
 
@@ -133,6 +152,12 @@ const App: React.FC = () => {
     URL.revokeObjectURL(url);
   };
 
+  // Helper for placeholder text
+  const getPlaceholder = () => {
+    if (mode === 'single') return "Type something amazing here...";
+    return `${speaker1.name}: Hey, how are you today?\n${speaker2.name}: I'm doing great! How about you?\n${speaker1.name}: I'm fantastic. Let's make some audio.`;
+  };
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-200 p-4 md:p-8 flex flex-col items-center">
       <div className="max-w-6xl w-full grid grid-cols-1 lg:grid-cols-2 gap-8">
@@ -151,85 +176,180 @@ const App: React.FC = () => {
 
           <div className="bg-slate-900/50 rounded-2xl p-6 border border-slate-800 shadow-xl backdrop-blur-sm">
             
-            {/* Voice Selection */}
-            <div className="mb-6">
-              <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">
-                Select Voice
-              </label>
-              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-                {VOICES.map((v) => (
-                  <button
-                    key={v.name}
-                    onClick={() => setVoice(v.name)}
-                    className={`relative p-3 rounded-xl border text-left transition-all ${
-                      voice === v.name
-                        ? 'bg-indigo-500/10 border-indigo-500 text-indigo-300 shadow-[0_0_15px_rgba(99,102,241,0.2)]'
-                        : 'bg-slate-800 border-slate-700 text-slate-400 hover:border-slate-600 hover:bg-slate-800/80'
-                    }`}
-                  >
-                    <div className="font-medium text-sm flex items-center justify-between">
-                      {v.label}
-                      {voice === v.name && <div className="w-2 h-2 rounded-full bg-indigo-500 animate-pulse" />}
-                    </div>
-                    <div className="text-[10px] opacity-70 mt-1">{v.gender} • {v.description}</div>
-                  </button>
-                ))}
-              </div>
+            {/* Mode Switcher */}
+            <div className="bg-slate-950 p-1 rounded-xl flex items-center mb-6 border border-slate-800">
+                <button 
+                  onClick={() => setMode('single')}
+                  className={`flex-1 py-2 rounded-lg text-sm font-medium transition-all flex items-center justify-center gap-2 ${
+                    mode === 'single' ? 'bg-slate-800 text-white shadow-sm' : 'text-slate-500 hover:text-slate-300'
+                  }`}
+                >
+                    <User size={16} /> Solo
+                </button>
+                <button 
+                  onClick={() => setMode('multi')}
+                  className={`flex-1 py-2 rounded-lg text-sm font-medium transition-all flex items-center justify-center gap-2 ${
+                    mode === 'multi' ? 'bg-slate-800 text-white shadow-sm' : 'text-slate-500 hover:text-slate-300'
+                  }`}
+                >
+                    <Users size={16} /> Conversation
+                </button>
             </div>
 
-            {/* Style Selection */}
-            <div className="mb-6">
-              <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">
-                Expression Style
-              </label>
-              <div className="flex flex-wrap gap-2 mb-3">
-                {STYLE_PRESETS.map((style) => (
-                  <button
-                    key={style}
-                    onClick={() => setStylePrompt(style)}
-                    className={`px-3 py-1.5 rounded-full text-xs font-medium border transition-colors ${
-                      stylePrompt === style
-                        ? 'bg-purple-500 text-white border-purple-500'
-                        : 'bg-slate-800 border-slate-700 text-slate-400 hover:border-slate-500'
-                    }`}
-                  >
-                    {style}
-                  </button>
-                ))}
-                <button
-                    onClick={() => setStylePrompt('Custom')}
-                    className={`px-3 py-1.5 rounded-full text-xs font-medium border transition-colors flex items-center gap-1 ${
-                      stylePrompt === 'Custom'
-                        ? 'bg-purple-500 text-white border-purple-500'
-                        : 'bg-slate-800 border-slate-700 text-slate-400 hover:border-slate-500'
-                    }`}
-                >
-                    <Wand2 size={12} /> Custom
-                </button>
-              </div>
-              
-              {stylePrompt === 'Custom' && (
-                <input 
-                  type="text"
-                  value={customStyle}
-                  onChange={(e) => setCustomStyle(e.target.value)}
-                  placeholder="e.g. Like a pirate, whispering in a library..."
-                  className="w-full bg-slate-950 border border-slate-700 rounded-lg px-4 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-purple-500/50"
-                  autoFocus
-                />
-              )}
-            </div>
+            {mode === 'single' ? (
+                <>
+                    {/* Solo Voice Selection */}
+                    <div className="mb-6">
+                    <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">
+                        Select Voice
+                    </label>
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                        {VOICES.map((v) => (
+                        <button
+                            key={v.name}
+                            onClick={() => setVoice(v.name)}
+                            className={`relative p-3 rounded-xl border text-left transition-all ${
+                            voice === v.name
+                                ? 'bg-indigo-500/10 border-indigo-500 text-indigo-300 shadow-[0_0_15px_rgba(99,102,241,0.2)]'
+                                : 'bg-slate-800 border-slate-700 text-slate-400 hover:border-slate-600 hover:bg-slate-800/80'
+                            }`}
+                        >
+                            <div className="font-medium text-sm flex items-center justify-between">
+                            {v.label}
+                            {voice === v.name && <div className="w-2 h-2 rounded-full bg-indigo-500 animate-pulse" />}
+                            </div>
+                            <div className="text-[10px] opacity-70 mt-1">{v.gender} • {v.description}</div>
+                        </button>
+                        ))}
+                    </div>
+                    </div>
+
+                    {/* Style Selection */}
+                    <div className="mb-6">
+                    <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">
+                        Expression Style
+                    </label>
+                    <div className="flex flex-wrap gap-2 mb-3">
+                        {STYLE_PRESETS.map((style) => (
+                        <button
+                            key={style}
+                            onClick={() => setStylePrompt(style)}
+                            className={`px-3 py-1.5 rounded-full text-xs font-medium border transition-colors ${
+                            stylePrompt === style
+                                ? 'bg-purple-500 text-white border-purple-500'
+                                : 'bg-slate-800 border-slate-700 text-slate-400 hover:border-slate-500'
+                            }`}
+                        >
+                            {style}
+                        </button>
+                        ))}
+                        <button
+                            onClick={() => setStylePrompt('Custom')}
+                            className={`px-3 py-1.5 rounded-full text-xs font-medium border transition-colors flex items-center gap-1 ${
+                            stylePrompt === 'Custom'
+                                ? 'bg-purple-500 text-white border-purple-500'
+                                : 'bg-slate-800 border-slate-700 text-slate-400 hover:border-slate-500'
+                            }`}
+                        >
+                            <Wand2 size={12} /> Custom
+                        </button>
+                    </div>
+                    
+                    {stylePrompt === 'Custom' && (
+                        <input 
+                        type="text"
+                        value={customStyle}
+                        onChange={(e) => setCustomStyle(e.target.value)}
+                        placeholder="e.g. Like a pirate, whispering in a library..."
+                        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-4 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-purple-500/50"
+                        />
+                    )}
+                    </div>
+                </>
+            ) : (
+                /* Multi Speaker Setup */
+                <div className="mb-6 space-y-4">
+                    <div className="flex items-center justify-between">
+                        <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider">
+                            Cast Configuration (2 Speakers)
+                        </label>
+                    </div>
+                    
+                    {/* Speaker 1 Config */}
+                    <div className="p-3 bg-slate-800/50 rounded-xl border border-slate-700/50">
+                        <div className="flex items-center gap-2 mb-2">
+                             <div className="w-5 h-5 rounded-full bg-indigo-500 flex items-center justify-center text-[10px] font-bold">1</div>
+                             <span className="text-xs font-medium text-indigo-200">First Speaker</span>
+                        </div>
+                        <div className="grid grid-cols-2 gap-3">
+                            <div>
+                                <label className="text-[10px] text-slate-500 mb-1 block">Name in Script</label>
+                                <input 
+                                    type="text" 
+                                    value={speaker1.name} 
+                                    onChange={(e) => setSpeaker1({...speaker1, name: e.target.value})}
+                                    className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:ring-1 focus:ring-indigo-500"
+                                />
+                            </div>
+                            <div>
+                                <label className="text-[10px] text-slate-500 mb-1 block">Voice</label>
+                                <select 
+                                    value={speaker1.voice}
+                                    onChange={(e) => setSpeaker1({...speaker1, voice: e.target.value})}
+                                    className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:ring-1 focus:ring-indigo-500 appearance-none"
+                                >
+                                    {VOICES.map(v => <option key={v.name} value={v.name}>{v.label} ({v.gender})</option>)}
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Speaker 2 Config */}
+                    <div className="p-3 bg-slate-800/50 rounded-xl border border-slate-700/50">
+                        <div className="flex items-center gap-2 mb-2">
+                             <div className="w-5 h-5 rounded-full bg-purple-500 flex items-center justify-center text-[10px] font-bold">2</div>
+                             <span className="text-xs font-medium text-purple-200">Second Speaker</span>
+                        </div>
+                        <div className="grid grid-cols-2 gap-3">
+                            <div>
+                                <label className="text-[10px] text-slate-500 mb-1 block">Name in Script</label>
+                                <input 
+                                    type="text" 
+                                    value={speaker2.name} 
+                                    onChange={(e) => setSpeaker2({...speaker2, name: e.target.value})}
+                                    className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:ring-1 focus:ring-purple-500"
+                                />
+                            </div>
+                            <div>
+                                <label className="text-[10px] text-slate-500 mb-1 block">Voice</label>
+                                <select 
+                                    value={speaker2.voice}
+                                    onChange={(e) => setSpeaker2({...speaker2, voice: e.target.value})}
+                                    className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:ring-1 focus:ring-purple-500 appearance-none"
+                                >
+                                    {VOICES.map(v => <option key={v.name} value={v.name}>{v.label} ({v.gender})</option>)}
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            )}
 
             {/* Text Input */}
             <div className="mb-6">
-              <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">
-                Script
-              </label>
+              <div className="flex justify-between items-center mb-3">
+                  <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider">
+                    Script
+                  </label>
+                  {mode === 'multi' && (
+                      <span className="text-[10px] text-slate-500">Format: Name: Message</span>
+                  )}
+              </div>
               <textarea
                 value={text}
                 onChange={(e) => setText(e.target.value)}
-                placeholder="Type something amazing here..."
-                className="w-full h-40 bg-slate-950 border border-slate-700 rounded-xl p-4 text-slate-200 placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 resize-none leading-relaxed"
+                placeholder={getPlaceholder()}
+                className="w-full h-40 bg-slate-950 border border-slate-700 rounded-xl p-4 text-slate-200 placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 resize-none leading-relaxed text-sm font-mono"
               />
             </div>
 
@@ -277,8 +397,10 @@ const App: React.FC = () => {
                         <span className="text-xs font-bold tracking-widest uppercase">Now Playing</span>
                     </div>
                     {activeId && history.find(h => h.id === activeId) && (
-                        <div className="text-xs text-slate-500">
-                            {history.find(h => h.id === activeId)?.voice} • {history.find(h => h.id === activeId)?.style}
+                        <div className="text-xs text-slate-500 flex items-center gap-2">
+                            <span>{history.find(h => h.id === activeId)?.voice}</span>
+                            <span className="w-1 h-1 bg-slate-600 rounded-full" />
+                            <span>{history.find(h => h.id === activeId)?.style}</span>
                         </div>
                     )}
                  </div>

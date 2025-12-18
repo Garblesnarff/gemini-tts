@@ -8,16 +8,24 @@ export interface VoiceOption {
 export interface GeneratedAudio {
   id: string;
   text: string;
-  voice: string;
+  voice: string; // "Puck" or "Duo: Joe & Jane"
   style: string;
   timestamp: number;
   audioBuffer: AudioBuffer | null;
   base64: string; // Stored for download/re-decoding if needed
   duration: number;
+  mode: 'single' | 'multi';
 }
 
-export interface TTSConfig {
-  voiceName: string;
-  stylePrompt: string;
+export interface SpeakerConfig {
+  name: string;
+  voice: string;
+}
+
+export interface TTSRequest {
   text: string;
+  mode: 'single' | 'multi';
+  voiceName?: string;
+  stylePrompt?: string;
+  speakers?: SpeakerConfig[];
 }
