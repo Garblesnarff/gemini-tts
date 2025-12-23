@@ -1,11 +1,15 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Mic, Play, Pause, Download, Volume2, Sparkles, Wand2, Loader2, Music4, Users, User, ArrowRightLeft } from 'lucide-react';
+import { Mic, Volume2, Sparkles, Wand2, Loader2, Music4, Users, User, Trash2, Archive, Save, FolderOpen, Upload } from 'lucide-react';
 import { VOICES, STYLE_PRESETS, SAMPLE_RATE } from './constants';
-import { GeneratedAudio, SpeakerConfig } from './types';
+import { GeneratedAudio, SpeakerConfig, SessionData } from './types';
 import { generateSpeech } from './services/geminiService';
-import { decodeAudioData, audioBufferToWav } from './utils/audioUtils';
+import { decodeAudioData, audioBufferToWav, audioBufferToMp3, createBatchZip } from './utils/audioUtils';
+import * as db from './utils/db';
 import Visualizer from './components/Visualizer';
 import { HistoryItem } from './components/HistoryItem';
+import PlayerControls from './components/PlayerControls';
+
+const MAX_CHAR_COUNT = 5000;
 
 const App: React.FC = () => {
   // Mode State
@@ -27,35 +31,205 @@ const App: React.FC = () => {
   const [isGenerating, setIsGenerating] = useState(false);
   const [history, setHistory] = useState<GeneratedAudio[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
-  const [isPlaying, setIsPlaying] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Player State
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [playbackRate, setPlaybackRate] = useState(1);
+  const [volume, setVolume] = useState(1);
 
   // Audio Refs
   const audioContextRef = useRef<AudioContext | null>(null);
   const sourceNodeRef = useRef<AudioBufferSourceNode | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
   const gainNodeRef = useRef<GainNode | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const startTimeRef = useRef<number>(0);
+  const pauseTimeRef = useRef<number>(0);
+  const rafRef = useRef<number>();
 
-  // Initialize Audio Context
+  // --- Persistence ---
+  useEffect(() => {
+    // Load history from DB on mount
+    const loadHistory = async () => {
+        try {
+            const savedItems = await db.getAllItems();
+            if (savedItems.length > 0) {
+                // We need to decode the audio buffers lazily or immediately? 
+                // For better UX, let's decode on demand OR decode mostly recent ones.
+                // Since decodeAudioData is async, we can start with empty buffers and hydrate them.
+                // However, without buffers we can't play. 
+                // Let's hydrate all for now since we are client-side only (limit usually fits in RAM).
+                const ctx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+                
+                const hydratedItems = await Promise.all(savedItems.map(async (item) => {
+                    const buffer = await decodeAudioData(item.base64, ctx, SAMPLE_RATE);
+                    return { ...item, audioBuffer: buffer };
+                }));
+                // Sort by timestamp desc
+                setHistory(hydratedItems.sort((a, b) => b.timestamp - a.timestamp));
+                audioContextRef.current = ctx; // Cache this context
+                setupAudioNodes(ctx);
+            }
+        } catch (e) {
+            console.error("Failed to load history", e);
+        }
+    };
+    loadHistory();
+  }, []);
+
+  // --- Audio Engine ---
+  const setupAudioNodes = (ctx: AudioContext) => {
+    if (!gainNodeRef.current) {
+        gainNodeRef.current = ctx.createGain();
+        analyserRef.current = ctx.createAnalyser();
+        analyserRef.current.fftSize = 256;
+        gainNodeRef.current.connect(analyserRef.current);
+        analyserRef.current.connect(ctx.destination);
+    }
+  };
+
   const initAudioContext = useCallback(() => {
     if (!audioContextRef.current) {
       audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({
         sampleRate: SAMPLE_RATE,
       });
-      analyserRef.current = audioContextRef.current.createAnalyser();
-      analyserRef.current.fftSize = 256;
-      gainNodeRef.current = audioContextRef.current.createGain();
-      gainNodeRef.current.connect(audioContextRef.current.destination);
+      setupAudioNodes(audioContextRef.current);
     } else if (audioContextRef.current.state === 'suspended') {
       audioContextRef.current.resume();
     }
+    return audioContextRef.current;
   }, []);
+
+  const stopAudio = useCallback(() => {
+    if (sourceNodeRef.current) {
+      try { sourceNodeRef.current.stop(); } catch (e) {}
+      sourceNodeRef.current = null;
+    }
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    setIsPlaying(false);
+  }, []);
+
+  const playAudio = useCallback((item: GeneratedAudio, offset: number = 0) => {
+    const ctx = initAudioContext();
+    if (!ctx || !item.audioBuffer || !gainNodeRef.current) return;
+
+    // If changing track, stop current
+    if (activeId !== item.id) {
+       stopAudio();
+    } else if (isPlaying) {
+        // If same track and playing, we are essentially restarting or seeking, handled below
+        stopAudio(); 
+    }
+
+    const source = ctx.createBufferSource();
+    source.buffer = item.audioBuffer;
+    source.playbackRate.value = playbackRate;
+    source.connect(gainNodeRef.current);
+
+    // Calc start times
+    const startAt = ctx.currentTime;
+    startTimeRef.current = startAt - (offset / playbackRate);
+    
+    source.start(0, offset);
+    sourceNodeRef.current = source;
+    
+    setActiveId(item.id);
+    setDuration(item.duration);
+    setIsPlaying(true);
+    
+    // Animation loop for UI
+    const tick = () => {
+        const current = (ctx.currentTime - startTimeRef.current) * playbackRate;
+        if (current >= item.duration) {
+            stopAudio();
+            setCurrentTime(item.duration);
+        } else {
+            setCurrentTime(current);
+            rafRef.current = requestAnimationFrame(tick);
+        }
+    };
+    tick();
+
+    source.onended = () => {
+       // handled by tick mostly, but cleanup
+    };
+  }, [activeId, isPlaying, playbackRate, initAudioContext, stopAudio]);
+
+  const handleSeek = (time: number) => {
+    if (!activeId) return;
+    const item = history.find(h => h.id === activeId);
+    if (!item) return;
+    
+    pauseTimeRef.current = time;
+    setCurrentTime(time);
+    
+    if (isPlaying) {
+        playAudio(item, time);
+    }
+  };
+
+  const handlePlayPause = () => {
+      if (!activeId && history.length > 0) {
+          playAudio(history[0], 0);
+          return;
+      }
+      if (!activeId) return;
+
+      const item = history.find(h => h.id === activeId);
+      if (!item) return;
+
+      if (isPlaying) {
+          stopAudio();
+          pauseTimeRef.current = currentTime;
+      } else {
+          playAudio(item, currentTime >= duration ? 0 : currentTime);
+      }
+  };
+
+  // Update volume/speed live
+  useEffect(() => {
+      if (gainNodeRef.current) gainNodeRef.current.gain.value = volume;
+  }, [volume]);
+
+  useEffect(() => {
+      if (sourceNodeRef.current) sourceNodeRef.current.playbackRate.value = playbackRate;
+      // If speed changes, we need to adjust startTimeRef so the playhead doesn't jump
+      // This is complex, simplest is to restart play at current time
+      if (isPlaying && activeId) {
+          const item = history.find(h => h.id === activeId);
+          if (item) playAudio(item, currentTime);
+      }
+  }, [playbackRate]);
+
+  // Keyboard Shortcuts
+  useEffect(() => {
+      const handleKey = (e: KeyboardEvent) => {
+          if (e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLInputElement) return;
+          if (e.code === 'Space') {
+              e.preventDefault();
+              handlePlayPause();
+          } else if (e.code === 'Escape') {
+              stopAudio();
+          }
+      };
+      window.addEventListener('keydown', handleKey);
+      return () => window.removeEventListener('keydown', handleKey);
+  }, [handlePlayPause, stopAudio]);
+
+
+  // --- Logic ---
 
   const handleGenerate = async () => {
     if (!text.trim()) return;
+    if (text.length > MAX_CHAR_COUNT) {
+        setError(`Text too long! Limit is ${MAX_CHAR_COUNT} characters.`);
+        return;
+    }
     setError(null);
     setIsGenerating(true);
-    initAudioContext();
+    const ctx = initAudioContext();
 
     try {
       const activeStyle = stylePrompt === 'Custom' ? customStyle : stylePrompt;
@@ -68,13 +242,10 @@ const App: React.FC = () => {
         speakers: [speaker1, speaker2]
       });
 
-      if (audioContextRef.current) {
-        const buffer = await decodeAudioData(base64Data, audioContextRef.current, SAMPLE_RATE);
+      if (ctx) {
+        const buffer = await decodeAudioData(base64Data, ctx, SAMPLE_RATE);
         
-        // Determine display voice label
-        const voiceLabel = mode === 'single' 
-          ? voice 
-          : `Duo: ${speaker1.name} & ${speaker2.name}`;
+        const voiceLabel = mode === 'single' ? voice : `Duo: ${speaker1.name} & ${speaker2.name}`;
 
         const newItem: GeneratedAudio = {
           id: Date.now().toString(),
@@ -85,93 +256,145 @@ const App: React.FC = () => {
           audioBuffer: buffer,
           base64: base64Data,
           duration: buffer.duration,
-          mode
+          mode,
+          isFavorite: false
         };
 
+        await db.saveItem(newItem);
         setHistory(prev => [newItem, ...prev]);
         playAudio(newItem);
       }
     } catch (err: any) {
-      setError(err.message || 'Failed to generate speech. Please check your API key.');
+      setError(err.message || 'Failed to generate speech.');
     } finally {
       setIsGenerating(false);
     }
   };
 
-  const stopAudio = useCallback(() => {
-    if (sourceNodeRef.current) {
-      try {
-        sourceNodeRef.current.stop();
-      } catch (e) {
-        // ignore
-      }
-      sourceNodeRef.current = null;
-    }
-    setIsPlaying(false);
-  }, []);
-
-  const playAudio = useCallback(async (item: GeneratedAudio) => {
-    initAudioContext();
-    if (!audioContextRef.current || !item.audioBuffer || !analyserRef.current || !gainNodeRef.current) return;
-
-    if (activeId === item.id && isPlaying) {
-      stopAudio();
-      return;
-    }
-    stopAudio();
-
-    const source = audioContextRef.current.createBufferSource();
-    source.buffer = item.audioBuffer;
-    
-    source.connect(analyserRef.current);
-    analyserRef.current.connect(gainNodeRef.current);
-
-    source.onended = () => {
-      setIsPlaying(false);
-    };
-
-    source.start(0);
-    sourceNodeRef.current = source;
-    setActiveId(item.id);
-    setIsPlaying(true);
-  }, [activeId, isPlaying, initAudioContext, stopAudio]);
-
-  const handleDelete = (id: string) => {
+  const handleDelete = async (id: string) => {
     if (activeId === id) stopAudio();
+    await db.deleteItem(id);
     setHistory(prev => prev.filter(item => item.id !== id));
   };
 
-  const handleDownload = (item: GeneratedAudio) => {
+  const handleToggleFavorite = async (id: string) => {
+      const item = history.find(h => h.id === id);
+      if (item) {
+          const newItem = { ...item, isFavorite: !item.isFavorite };
+          await db.saveItem(newItem);
+          setHistory(prev => prev.map(p => p.id === id ? newItem : p));
+      }
+  };
+
+  const handleDownload = (item: GeneratedAudio, format: 'wav' | 'mp3') => {
     if (!item.audioBuffer) return;
-    const blob = audioBufferToWav(item.audioBuffer);
+    let blob: Blob;
+    if (format === 'mp3') {
+        blob = audioBufferToMp3(item.audioBuffer);
+    } else {
+        blob = audioBufferToWav(item.audioBuffer);
+    }
+    
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `gemini-vox-${item.id}.wav`;
+    a.download = `gemini-vox-${item.id}.${format}`;
     a.click();
     URL.revokeObjectURL(url);
   };
 
-  // Helper for placeholder text
-  const getPlaceholder = () => {
-    if (mode === 'single') return "Type something amazing here...";
-    return `${speaker1.name}: Hey, how are you today?\n${speaker2.name}: I'm doing great! How about you?\n${speaker1.name}: I'm fantastic. Let's make some audio.`;
+  const handleBatchDownload = async () => {
+      if (history.length === 0) return;
+      try {
+          const blob = await createBatchZip(history);
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `gemini-vox-history-${Date.now()}.zip`;
+          a.click();
+          URL.revokeObjectURL(url);
+      } catch (e) {
+          console.error(e);
+          setError("Failed to create zip");
+      }
+  };
+
+  const handleExportSession = async () => {
+      const exportData: SessionData = {
+          version: 1,
+          timestamp: Date.now(),
+          history: history.map(({ audioBuffer, ...rest }) => rest)
+      };
+      const blob = new Blob([JSON.stringify(exportData)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `gemini-vox-session.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+  };
+
+  const handleImportSession = (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      if (!file) return;
+      
+      const reader = new FileReader();
+      reader.onload = async (event) => {
+          try {
+              const data = JSON.parse(event.target?.result as string) as SessionData;
+              if (data.history) {
+                  const ctx = initAudioContext();
+                  const hydrated = await Promise.all(data.history.map(async (item) => {
+                       const buffer = await decodeAudioData(item.base64, ctx, SAMPLE_RATE);
+                       await db.saveItem({ ...item, audioBuffer: buffer } as GeneratedAudio);
+                       return { ...item, audioBuffer: buffer } as GeneratedAudio;
+                  }));
+                  setHistory(prev => [...hydrated, ...prev]); // Append imported
+              }
+          } catch (e) {
+              setError("Invalid session file");
+          }
+      };
+      reader.readAsText(file);
+      e.target.value = ''; // reset
+  };
+
+  const handleClearAll = async () => {
+      if (confirm("Are you sure you want to delete all history?")) {
+          stopAudio();
+          await db.clearDB();
+          setHistory([]);
+          setActiveId(null);
+      }
   };
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-200 p-4 md:p-8 flex flex-col items-center">
-      <div className="max-w-6xl w-full grid grid-cols-1 lg:grid-cols-2 gap-8">
+      <div className="max-w-6xl w-full grid grid-cols-1 lg:grid-cols-2 gap-8 mb-24">
         
         {/* LEFT COLUMN: Controls */}
         <div className="space-y-6">
-          <div className="space-y-2">
-            <h1 className="text-3xl font-bold bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent flex items-center gap-3">
-              <Sparkles className="text-indigo-400" />
-              Gemini Vox
-            </h1>
-            <p className="text-slate-400 text-sm">
-              Next-gen Text-to-Speech powered by Gemini 2.5 Flash
-            </p>
+          <div className="flex items-center justify-between">
+            <div>
+                <h1 className="text-3xl font-bold bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent flex items-center gap-3">
+                <Sparkles className="text-indigo-400" />
+                Gemini Vox
+                </h1>
+                <p className="text-slate-400 text-sm">
+                Next-gen Text-to-Speech powered by Gemini 2.5 Flash
+                </p>
+            </div>
+            
+            {/* Header Actions */}
+            <div className="flex gap-2">
+                <label className="p-2 text-slate-400 hover:text-indigo-400 cursor-pointer" title="Import Session">
+                    <FolderOpen size={20} />
+                    <input type="file" accept=".json" onChange={handleImportSession} className="hidden" />
+                </label>
+                <button onClick={handleExportSession} className="p-2 text-slate-400 hover:text-indigo-400" title="Export Session">
+                    <Save size={20} />
+                </button>
+            </div>
           </div>
 
           <div className="bg-slate-900/50 rounded-2xl p-6 border border-slate-800 shadow-xl backdrop-blur-sm">
@@ -275,80 +498,68 @@ const App: React.FC = () => {
                         </label>
                     </div>
                     
-                    {/* Speaker 1 Config */}
-                    <div className="p-3 bg-slate-800/50 rounded-xl border border-slate-700/50">
-                        <div className="flex items-center gap-2 mb-2">
-                             <div className="w-5 h-5 rounded-full bg-indigo-500 flex items-center justify-center text-[10px] font-bold">1</div>
-                             <span className="text-xs font-medium text-indigo-200">First Speaker</span>
-                        </div>
-                        <div className="grid grid-cols-2 gap-3">
-                            <div>
-                                <label className="text-[10px] text-slate-500 mb-1 block">Name in Script</label>
-                                <input 
-                                    type="text" 
-                                    value={speaker1.name} 
-                                    onChange={(e) => setSpeaker1({...speaker1, name: e.target.value})}
-                                    className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:ring-1 focus:ring-indigo-500"
-                                />
+                    <div className="grid grid-cols-2 gap-4">
+                        {/* Speaker 1 */}
+                        <div className="p-3 bg-slate-800/50 rounded-xl border border-slate-700/50">
+                            <div className="flex items-center gap-2 mb-2">
+                                <div className="w-5 h-5 rounded-full bg-indigo-500 flex items-center justify-center text-[10px] font-bold">1</div>
+                                <span className="text-xs font-medium text-indigo-200">First Speaker</span>
                             </div>
-                            <div>
-                                <label className="text-[10px] text-slate-500 mb-1 block">Voice</label>
-                                <select 
-                                    value={speaker1.voice}
-                                    onChange={(e) => setSpeaker1({...speaker1, voice: e.target.value})}
-                                    className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:ring-1 focus:ring-indigo-500 appearance-none"
-                                >
-                                    {VOICES.map(v => <option key={v.name} value={v.name}>{v.label} ({v.gender})</option>)}
-                                </select>
-                            </div>
+                            <input 
+                                type="text" 
+                                value={speaker1.name} 
+                                onChange={(e) => setSpeaker1({...speaker1, name: e.target.value})}
+                                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-slate-200 mb-2 focus:ring-1 focus:ring-indigo-500"
+                                placeholder="Name"
+                            />
+                            <select 
+                                value={speaker1.voice}
+                                onChange={(e) => setSpeaker1({...speaker1, voice: e.target.value})}
+                                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-slate-200 focus:ring-1 focus:ring-indigo-500"
+                            >
+                                {VOICES.map(v => <option key={v.name} value={v.name}>{v.label}</option>)}
+                            </select>
                         </div>
-                    </div>
 
-                    {/* Speaker 2 Config */}
-                    <div className="p-3 bg-slate-800/50 rounded-xl border border-slate-700/50">
-                        <div className="flex items-center gap-2 mb-2">
-                             <div className="w-5 h-5 rounded-full bg-purple-500 flex items-center justify-center text-[10px] font-bold">2</div>
-                             <span className="text-xs font-medium text-purple-200">Second Speaker</span>
-                        </div>
-                        <div className="grid grid-cols-2 gap-3">
-                            <div>
-                                <label className="text-[10px] text-slate-500 mb-1 block">Name in Script</label>
-                                <input 
-                                    type="text" 
-                                    value={speaker2.name} 
-                                    onChange={(e) => setSpeaker2({...speaker2, name: e.target.value})}
-                                    className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:ring-1 focus:ring-purple-500"
-                                />
+                        {/* Speaker 2 */}
+                        <div className="p-3 bg-slate-800/50 rounded-xl border border-slate-700/50">
+                            <div className="flex items-center gap-2 mb-2">
+                                <div className="w-5 h-5 rounded-full bg-purple-500 flex items-center justify-center text-[10px] font-bold">2</div>
+                                <span className="text-xs font-medium text-purple-200">Second Speaker</span>
                             </div>
-                            <div>
-                                <label className="text-[10px] text-slate-500 mb-1 block">Voice</label>
-                                <select 
-                                    value={speaker2.voice}
-                                    onChange={(e) => setSpeaker2({...speaker2, voice: e.target.value})}
-                                    className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:ring-1 focus:ring-purple-500 appearance-none"
-                                >
-                                    {VOICES.map(v => <option key={v.name} value={v.name}>{v.label} ({v.gender})</option>)}
-                                </select>
-                            </div>
+                            <input 
+                                type="text" 
+                                value={speaker2.name} 
+                                onChange={(e) => setSpeaker2({...speaker2, name: e.target.value})}
+                                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-slate-200 mb-2 focus:ring-1 focus:ring-purple-500"
+                                placeholder="Name"
+                            />
+                            <select 
+                                value={speaker2.voice}
+                                onChange={(e) => setSpeaker2({...speaker2, voice: e.target.value})}
+                                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-slate-200 focus:ring-1 focus:ring-purple-500"
+                            >
+                                {VOICES.map(v => <option key={v.name} value={v.name}>{v.label}</option>)}
+                            </select>
                         </div>
                     </div>
                 </div>
             )}
 
             {/* Text Input */}
-            <div className="mb-6">
+            <div className="mb-6 relative">
               <div className="flex justify-between items-center mb-3">
                   <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider">
                     Script
                   </label>
-                  {mode === 'multi' && (
-                      <span className="text-[10px] text-slate-500">Format: Name: Message</span>
-                  )}
+                  <span className={`text-[10px] ${text.length > MAX_CHAR_COUNT ? 'text-red-400' : 'text-slate-500'}`}>
+                      {text.length} / {MAX_CHAR_COUNT}
+                  </span>
               </div>
               <textarea
                 value={text}
                 onChange={(e) => setText(e.target.value)}
-                placeholder={getPlaceholder()}
+                placeholder={mode === 'single' ? "Type something..." : "Name: Message..."}
                 className="w-full h-40 bg-slate-950 border border-slate-700 rounded-xl p-4 text-slate-200 placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 resize-none leading-relaxed text-sm font-mono"
               />
             </div>
@@ -356,16 +567,16 @@ const App: React.FC = () => {
             {/* Action */}
             <button
               onClick={handleGenerate}
-              disabled={isGenerating || !text.trim()}
+              disabled={isGenerating || !text.trim() || text.length > MAX_CHAR_COUNT}
               className={`w-full py-4 rounded-xl font-bold flex items-center justify-center gap-2 transition-all shadow-lg ${
-                isGenerating || !text.trim()
+                isGenerating || !text.trim() || text.length > MAX_CHAR_COUNT
                   ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
                   : 'bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white shadow-indigo-500/20 active:scale-[0.98]'
               }`}
             >
               {isGenerating ? (
                 <>
-                  <Loader2 className="animate-spin" size={20} /> Generating Audio...
+                  <Loader2 className="animate-spin" size={20} /> Generating...
                 </>
               ) : (
                 <>
@@ -385,54 +596,75 @@ const App: React.FC = () => {
         {/* RIGHT COLUMN: Output & History */}
         <div className="space-y-6 flex flex-col h-full">
           {/* Main Visualizer Panel */}
-          <div className="bg-slate-900 rounded-2xl p-6 border border-slate-800 shadow-xl relative overflow-hidden min-h-[200px] flex flex-col justify-center items-center">
-            {/* Background Decor */}
-            <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500" />
-            
-            {activeId ? (
-               <div className="w-full space-y-4 relative z-10">
-                 <div className="flex items-center justify-between px-2">
-                    <div className="flex items-center gap-2 text-indigo-400">
-                        {isPlaying ? <Music4 className="animate-pulse" size={16} /> : <Volume2 size={16}/>}
-                        <span className="text-xs font-bold tracking-widest uppercase">Now Playing</span>
-                    </div>
-                    {activeId && history.find(h => h.id === activeId) && (
-                        <div className="text-xs text-slate-500 flex items-center gap-2">
-                            <span>{history.find(h => h.id === activeId)?.voice}</span>
-                            <span className="w-1 h-1 bg-slate-600 rounded-full" />
-                            <span>{history.find(h => h.id === activeId)?.style}</span>
+          <div className="bg-slate-900 rounded-2xl border border-slate-800 shadow-xl relative overflow-hidden flex flex-col">
+             <div className="h-[200px] relative flex items-center justify-center bg-slate-950/50">
+                {/* Visualizer BG */}
+                <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500" />
+                
+                {activeId ? (
+                   <div className="w-full h-full p-6 flex flex-col justify-end">
+                      <div className="mb-auto flex items-center gap-2 text-indigo-400">
+                           {isPlaying ? <Music4 className="animate-pulse" size={16} /> : <Volume2 size={16}/>}
+                           <span className="text-xs font-bold tracking-widest uppercase">Now Playing</span>
+                      </div>
+                      <Visualizer 
+                          analyser={analyserRef.current} 
+                          isPlaying={isPlaying} 
+                          color="#818cf8"
+                       />
+                   </div>
+                ) : (
+                    <div className="text-center text-slate-600 flex flex-col items-center p-6">
+                        <div className="w-16 h-16 rounded-full bg-slate-800 flex items-center justify-center mb-4">
+                            <Volume2 size={24} className="text-slate-500" />
                         </div>
-                    )}
-                 </div>
-                 <Visualizer 
-                    analyser={analyserRef.current} 
-                    isPlaying={isPlaying} 
-                    color="#818cf8"
-                 />
-               </div>
-            ) : (
-                <div className="text-center text-slate-600 flex flex-col items-center">
-                    <div className="w-16 h-16 rounded-full bg-slate-800 flex items-center justify-center mb-4">
-                        <Volume2 size={24} className="text-slate-500" />
+                        <p className="text-sm font-medium">Ready to speak</p>
                     </div>
-                    <p className="text-sm font-medium">Ready to speak</p>
-                    <p className="text-xs mt-1 max-w-[200px]">Generate some audio to see the visualization live.</p>
-                </div>
-            )}
+                )}
+             </div>
+
+             {/* Player Controls */}
+             <PlayerControls 
+                isPlaying={isPlaying}
+                currentTime={currentTime}
+                duration={duration}
+                volume={volume}
+                playbackRate={playbackRate}
+                onPlayPause={handlePlayPause}
+                onSeek={handleSeek}
+                onVolumeChange={setVolume}
+                onSpeedChange={setPlaybackRate}
+             />
           </div>
 
           {/* History List */}
-          <div className="flex-1 bg-slate-900/50 rounded-2xl border border-slate-800 shadow-xl flex flex-col overflow-hidden">
-            <div className="p-4 border-b border-slate-800 bg-slate-900/80 backdrop-blur-sm sticky top-0 z-10">
+          <div className="flex-1 bg-slate-900/50 rounded-2xl border border-slate-800 shadow-xl flex flex-col overflow-hidden min-h-[400px]">
+            <div className="p-4 border-b border-slate-800 bg-slate-900/80 backdrop-blur-sm sticky top-0 z-10 flex justify-between items-center">
               <h3 className="font-semibold text-slate-300 flex items-center gap-2">
                 <span className="w-2 h-2 rounded-full bg-green-500" />
                 History ({history.length})
               </h3>
+              <div className="flex gap-2">
+                  <button 
+                    onClick={handleBatchDownload} 
+                    className="p-1.5 text-slate-400 hover:text-indigo-400 rounded-lg hover:bg-slate-800 transition-colors"
+                    title="Download All as ZIP"
+                  >
+                      <Archive size={18} />
+                  </button>
+                  <button 
+                    onClick={handleClearAll} 
+                    className="p-1.5 text-slate-400 hover:text-red-400 rounded-lg hover:bg-slate-800 transition-colors"
+                    title="Clear All"
+                  >
+                      <Trash2 size={18} />
+                  </button>
+              </div>
             </div>
             
             <div className="flex-1 overflow-y-auto p-4 space-y-3">
               {history.length === 0 ? (
-                <div className="h-full flex flex-col items-center justify-center text-slate-600 opacity-60 min-h-[200px]">
+                <div className="h-full flex flex-col items-center justify-center text-slate-600 opacity-60">
                   <p className="text-sm">No generations yet.</p>
                 </div>
               ) : (
@@ -442,23 +674,18 @@ const App: React.FC = () => {
                     item={item}
                     isPlaying={isPlaying}
                     isActive={activeId === item.id}
-                    onPlay={playAudio}
-                    onPause={stopAudio}
+                    onPlay={() => playAudio(item, 0)}
+                    onPause={handlePlayPause}
                     onDelete={handleDelete}
                     onDownload={handleDownload}
+                    onToggleFavorite={handleToggleFavorite}
                   />
                 ))
               )}
             </div>
           </div>
         </div>
-
       </div>
-      
-      {/* Footer */}
-      <footer className="mt-12 text-slate-600 text-xs text-center pb-4">
-        <p>Built with Gemini 2.5 Flash & React</p>
-      </footer>
     </div>
   );
 };

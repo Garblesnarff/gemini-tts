@@ -1,3 +1,7 @@
+import JSZip from 'jszip';
+import { Mp3Encoder } from '@breezystack/lamejs';
+import { GeneratedAudio } from '../types';
+
 // Decodes Base64 string to raw binary string
 function atobBinary(base64: string): string {
   return window.atob(base64);
@@ -37,7 +41,7 @@ export async function decodeAudioData(
   return buffer;
 }
 
-// Helper to convert AudioBuffer to WAV for download
+// Convert AudioBuffer to WAV Blob
 export function audioBufferToWav(buffer: AudioBuffer): Blob {
   const numOfChan = buffer.numberOfChannels;
   const length = buffer.length * numOfChan * 2 + 44;
@@ -92,4 +96,76 @@ export function audioBufferToWav(buffer: AudioBuffer): Blob {
     view.setUint32(pos, data, true);
     pos += 4;
   }
+}
+
+// Convert AudioBuffer to MP3 Blob using lamejs
+export function audioBufferToMp3(buffer: AudioBuffer): Blob {
+  const channels = buffer.numberOfChannels;
+  const sampleRate = buffer.sampleRate;
+  const mp3encoder = new Mp3Encoder(channels, sampleRate, 128); // 128kbps
+
+  // Get PCM data from AudioBuffer (Float32 -> Int16)
+  const samples = buffer.getChannelData(0); // Assuming mono for now, Gemini is mono mostly
+  const sampleBlockSize = 1152;
+  const mp3Data = [];
+
+  const samplesInt16 = new Int16Array(samples.length);
+  for (let i = 0; i < samples.length; i++) {
+    let s = Math.max(-1, Math.min(1, samples[i]));
+    samplesInt16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+  }
+
+  let remaining = samplesInt16.length;
+  let i = 0;
+  
+  while (remaining >= sampleBlockSize) {
+    const chunk = samplesInt16.subarray(i, i + sampleBlockSize);
+    const mp3buf = mp3encoder.encodeBuffer(chunk);
+    if (mp3buf.length > 0) {
+      mp3Data.push(mp3buf);
+    }
+    remaining -= sampleBlockSize;
+    i += sampleBlockSize;
+  }
+  
+  const mp3buf = mp3encoder.flush();
+  if (mp3buf.length > 0) {
+    mp3Data.push(mp3buf);
+  }
+
+  return new Blob(mp3Data, { type: 'audio/mp3' });
+}
+
+// Zip multiple audio files
+export async function createBatchZip(items: GeneratedAudio[]): Promise<Blob> {
+  const zip = new JSZip();
+  const folder = zip.folder("gemini-vox-export");
+
+  if (!folder) throw new Error("Could not create zip folder");
+
+  items.forEach(item => {
+    if (item.audioBuffer) {
+        // Prefer MP3 for zip if possible, otherwise WAV
+        // To be safe and fast, let's use WAV for batch as it's raw
+        const blob = audioBufferToWav(item.audioBuffer);
+        const filename = `${item.id}-${item.voice.replace(/\s+/g, '_')}.wav`;
+        folder.file(filename, blob);
+    }
+  });
+
+  return await zip.generateAsync({ type: "blob" });
+}
+
+// Stitch multiple AudioBuffers (for chunking support)
+export function stitchBuffers(buffers: AudioBuffer[], ctx: AudioContext): AudioBuffer {
+    const totalLength = buffers.reduce((acc, b) => acc + b.length, 0);
+    const result = ctx.createBuffer(1, totalLength, buffers[0].sampleRate);
+    const data = result.getChannelData(0);
+    
+    let offset = 0;
+    for (const buf of buffers) {
+        data.set(buf.getChannelData(0), offset);
+        offset += buf.length;
+    }
+    return result;
 }

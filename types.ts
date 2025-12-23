@@ -15,6 +15,7 @@ export interface GeneratedAudio {
   base64: string; // Stored for download/re-decoding if needed
   duration: number;
   mode: 'single' | 'multi';
+  isFavorite?: boolean;
 }
 
 export interface SpeakerConfig {
@@ -28,4 +29,10 @@ export interface TTSRequest {
   voiceName?: string;
   stylePrompt?: string;
   speakers?: SpeakerConfig[];
+}
+
+export interface SessionData {
+  version: number;
+  timestamp: number;
+  history: Omit<GeneratedAudio, 'audioBuffer'>[]; // Exclude buffer from JSON export, re-create from base64 on import
 }
