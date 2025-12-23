@@ -19,8 +19,10 @@ export interface GeneratedAudio {
 }
 
 export interface SpeakerConfig {
+  id: string;
   name: string;
   voice: string;
+  color: string;
 }
 
 export interface TTSRequest {
@@ -34,5 +36,11 @@ export interface TTSRequest {
 export interface SessionData {
   version: number;
   timestamp: number;
-  history: Omit<GeneratedAudio, 'audioBuffer'>[]; // Exclude buffer from JSON export, re-create from base64 on import
+  history: Omit<GeneratedAudio, 'audioBuffer'>[];
+}
+
+export interface ToastMessage {
+  id: string;
+  type: 'success' | 'error' | 'info';
+  message: string;
 }

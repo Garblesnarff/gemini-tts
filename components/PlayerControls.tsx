@@ -31,9 +31,9 @@ const PlayerControls: React.FC<PlayerControlsProps> = ({
     };
 
     return (
-        <div className="w-full bg-slate-900 border-t border-slate-800 p-4 space-y-3">
+        <div className="w-full bg-white dark:bg-slate-900 border-t border-slate-200 dark:border-slate-800 p-4 space-y-3">
             {/* Progress Bar */}
-            <div className="flex items-center gap-3 text-xs text-slate-400">
+            <div className="flex items-center gap-3 text-xs text-slate-500 dark:text-slate-400">
                 <span className="w-10 text-right font-mono">{formatTime(currentTime)}</span>
                 <input 
                     type="range" 
@@ -42,7 +42,7 @@ const PlayerControls: React.FC<PlayerControlsProps> = ({
                     step={0.01}
                     value={currentTime}
                     onChange={(e) => onSeek(parseFloat(e.target.value))}
-                    className="flex-1 h-2 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-indigo-500"
+                    className="flex-1 h-2 bg-slate-200 dark:bg-slate-800 rounded-lg appearance-none cursor-pointer accent-indigo-500"
                 />
                 <span className="w-10 font-mono">{formatTime(duration)}</span>
             </div>
@@ -52,7 +52,7 @@ const PlayerControls: React.FC<PlayerControlsProps> = ({
                 <div className="flex items-center gap-2 w-1/4">
                     <button 
                         onClick={() => onVolumeChange(volume === 0 ? 1 : 0)}
-                        className="text-slate-400 hover:text-indigo-400 transition-colors"
+                        className="text-slate-400 hover:text-indigo-500 dark:hover:text-indigo-400 transition-colors"
                     >
                         {volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
                     </button>
@@ -63,7 +63,7 @@ const PlayerControls: React.FC<PlayerControlsProps> = ({
                         step="0.05"
                         value={volume}
                         onChange={(e) => onVolumeChange(parseFloat(e.target.value))}
-                        className="w-24 h-1 bg-slate-700 rounded-full appearance-none accent-indigo-500"
+                        className="w-24 h-1 bg-slate-300 dark:bg-slate-700 rounded-full appearance-none accent-indigo-500"
                     />
                 </div>
 
@@ -71,7 +71,7 @@ const PlayerControls: React.FC<PlayerControlsProps> = ({
                 <div className="flex items-center gap-4">
                     <button 
                         onClick={() => onSeek(Math.max(0, currentTime - 5))}
-                        className="text-slate-400 hover:text-white transition-colors p-2"
+                        className="text-slate-400 hover:text-slate-700 dark:hover:text-white transition-colors p-2"
                         title="-5s"
                     >
                         <SkipBack size={20} />
@@ -84,7 +84,7 @@ const PlayerControls: React.FC<PlayerControlsProps> = ({
                     </button>
                     <button 
                         onClick={() => onSeek(Math.min(duration, currentTime + 5))}
-                        className="text-slate-400 hover:text-white transition-colors p-2"
+                        className="text-slate-400 hover:text-slate-700 dark:hover:text-white transition-colors p-2"
                         title="+5s"
                     >
                         <SkipForward size={20} />
@@ -97,7 +97,7 @@ const PlayerControls: React.FC<PlayerControlsProps> = ({
                     <select 
                         value={playbackRate}
                         onChange={(e) => onSpeedChange(parseFloat(e.target.value))}
-                        className="bg-slate-800 text-slate-300 text-xs rounded-md border border-slate-700 px-2 py-1 outline-none focus:border-indigo-500"
+                        className="bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300 text-xs rounded-md border border-slate-300 dark:border-slate-700 px-2 py-1 outline-none focus:border-indigo-500"
                     >
                         <option value="0.5">0.5x</option>
                         <option value="1">1.0x</option>

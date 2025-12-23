@@ -14,25 +14,20 @@ export const generateSpeech = async (request: TTSRequest): Promise<string> => {
 
   let contentsPayload: any[] = [];
 
-  if (mode === 'multi' && speakers && speakers.length === 2) {
+  if (mode === 'multi' && speakers && speakers.length >= 2) {
     // Multi-speaker Logic
     // Construct a specific prompt for the conversation
-    const conversationPrompt = `TTS the following conversation between ${speakers[0].name} and ${speakers[1].name}:\n\n${text}`;
+    const speakerNames = speakers.map(s => s.name).join(', ');
+    const conversationPrompt = `TTS the following conversation between ${speakerNames}:\n\n${text}`;
     
     contentsPayload = [{ parts: [{ text: conversationPrompt }] }];
 
     config.speechConfig = {
       multiSpeakerVoiceConfig: {
-        speakerVoiceConfigs: [
-          {
-            speaker: speakers[0].name,
-            voiceConfig: { prebuiltVoiceConfig: { voiceName: speakers[0].voice } }
-          },
-          {
-            speaker: speakers[1].name,
-            voiceConfig: { prebuiltVoiceConfig: { voiceName: speakers[1].voice } }
-          }
-        ]
+        speakerVoiceConfigs: speakers.map(s => ({
+            speaker: s.name,
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: s.voice } }
+        }))
       }
     };
   } else {
