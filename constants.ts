@@ -20,3 +20,15 @@ export const STYLE_PRESETS = [
 ];
 
 export const SAMPLE_RATE = 24000;
+
+export const SPEAKER_COLORS = ['#6366f1', '#a855f7', '#ec4899', '#f59e0b', '#10b981'];
+
+// In a real app, these would be base64 strings or URLs to pre-generated audio files.
+// For this demo, we can just assume they might be populated.
+export const VOICE_PREVIEWS: Record<string, string> = {
+  Puck: "", 
+  Charon: "",
+  Kore: "",
+  Fenrir: "",
+  Zephyr: ""
+};

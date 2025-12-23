@@ -1,17 +1,33 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Mic, Volume2, Sparkles, Wand2, Loader2, Music4, Users, User, Trash2, Archive, Save, FolderOpen, Upload } from 'lucide-react';
-import { VOICES, STYLE_PRESETS, SAMPLE_RATE } from './constants';
-import { GeneratedAudio, SpeakerConfig, SessionData } from './types';
+import { Mic, Volume2, Sparkles, Wand2, Loader2, Music4, Users, User, Trash2, Archive, Save, FolderOpen, Upload, Sun, Moon, Plus, Minus, BarChart3, Activity } from 'lucide-react';
+import { VOICES, STYLE_PRESETS, SAMPLE_RATE, SPEAKER_COLORS, VOICE_PREVIEWS } from './constants';
+import { GeneratedAudio, SpeakerConfig, SessionData, ToastMessage } from './types';
 import { generateSpeech } from './services/geminiService';
 import { decodeAudioData, audioBufferToWav, audioBufferToMp3, createBatchZip } from './utils/audioUtils';
 import * as db from './utils/db';
 import Visualizer from './components/Visualizer';
 import { HistoryItem } from './components/HistoryItem';
 import PlayerControls from './components/PlayerControls';
+import ToastContainer from './components/Toast';
 
 const MAX_CHAR_COUNT = 5000;
 
 const App: React.FC = () => {
+  // Theme State
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => {
+    if (typeof window !== 'undefined') {
+        return localStorage.getItem('gemini-vox-theme') as 'dark' | 'light' || 'dark';
+    }
+    return 'dark';
+  });
+
+  // Toasts
+  const [toasts, setToasts] = useState<ToastMessage[]>([]);
+  const addToast = (type: 'success' | 'error' | 'info', message: string) => {
+    setToasts(prev => [...prev, { id: Date.now().toString(), type, message }]);
+  };
+  const dismissToast = (id: string) => setToasts(prev => prev.filter(t => t.id !== id));
+
   // Mode State
   const [mode, setMode] = useState<'single' | 'multi'>('single');
 
@@ -23,15 +39,22 @@ const App: React.FC = () => {
   const [stylePrompt, setStylePrompt] = useState('Normal');
   const [customStyle, setCustomStyle] = useState('');
 
-  // Multi Mode State
-  const [speaker1, setSpeaker1] = useState<SpeakerConfig>({ name: 'Joe', voice: 'Puck' });
-  const [speaker2, setSpeaker2] = useState<SpeakerConfig>({ name: 'Jane', voice: 'Kore' });
+  // Multi Mode State (3+ Speakers)
+  const [speakers, setSpeakers] = useState<SpeakerConfig[]>([
+    { id: '1', name: 'Joe', voice: 'Puck', color: SPEAKER_COLORS[0] },
+    { id: '2', name: 'Jane', voice: 'Kore', color: SPEAKER_COLORS[1] }
+  ]);
+
+  // Voice Preview State
+  const [previewVoice, setPreviewVoice] = useState<string | null>(null);
   
+  // Visualizer Mode
+  const [vizMode, setVizMode] = useState<'spectrum' | 'waveform'>('spectrum');
+
   // App State
   const [isGenerating, setIsGenerating] = useState(false);
   const [history, setHistory] = useState<GeneratedAudio[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
 
   // Player State
   const [isPlaying, setIsPlaying] = useState(false);
@@ -43,11 +66,23 @@ const App: React.FC = () => {
   // Audio Refs
   const audioContextRef = useRef<AudioContext | null>(null);
   const sourceNodeRef = useRef<AudioBufferSourceNode | null>(null);
+  const previewSourceRef = useRef<AudioBufferSourceNode | null>(null); // For voice preview
   const gainNodeRef = useRef<GainNode | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const startTimeRef = useRef<number>(0);
   const pauseTimeRef = useRef<number>(0);
   const rafRef = useRef<number>();
+
+  // --- Theme Effect ---
+  useEffect(() => {
+      const root = window.document.documentElement;
+      if (theme === 'dark') {
+          root.classList.add('dark');
+      } else {
+          root.classList.remove('dark');
+      }
+      localStorage.setItem('gemini-vox-theme', theme);
+  }, [theme]);
 
   // --- Persistence ---
   useEffect(() => {
@@ -56,11 +91,6 @@ const App: React.FC = () => {
         try {
             const savedItems = await db.getAllItems();
             if (savedItems.length > 0) {
-                // We need to decode the audio buffers lazily or immediately? 
-                // For better UX, let's decode on demand OR decode mostly recent ones.
-                // Since decodeAudioData is async, we can start with empty buffers and hydrate them.
-                // However, without buffers we can't play. 
-                // Let's hydrate all for now since we are client-side only (limit usually fits in RAM).
                 const ctx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: SAMPLE_RATE });
                 
                 const hydratedItems = await Promise.all(savedItems.map(async (item) => {
@@ -74,6 +104,7 @@ const App: React.FC = () => {
             }
         } catch (e) {
             console.error("Failed to load history", e);
+            addToast('error', 'Failed to load history');
         }
     };
     loadHistory();
@@ -84,7 +115,7 @@ const App: React.FC = () => {
     if (!gainNodeRef.current) {
         gainNodeRef.current = ctx.createGain();
         analyserRef.current = ctx.createAnalyser();
-        analyserRef.current.fftSize = 256;
+        analyserRef.current.fftSize = 256; // Keep 256 for now, can increase for waveform resolution
         gainNodeRef.current.connect(analyserRef.current);
         analyserRef.current.connect(ctx.destination);
     }
@@ -115,12 +146,14 @@ const App: React.FC = () => {
     const ctx = initAudioContext();
     if (!ctx || !item.audioBuffer || !gainNodeRef.current) return;
 
-    // If changing track, stop current
-    if (activeId !== item.id) {
-       stopAudio();
-    } else if (isPlaying) {
-        // If same track and playing, we are essentially restarting or seeking, handled below
-        stopAudio(); 
+    if (activeId !== item.id) stopAudio();
+    else if (isPlaying) stopAudio();
+
+    // Stop preview if playing
+    if (previewSourceRef.current) {
+        try { previewSourceRef.current.stop(); } catch (e) {}
+        previewSourceRef.current = null;
+        setPreviewVoice(null);
     }
 
     const source = ctx.createBufferSource();
@@ -128,7 +161,6 @@ const App: React.FC = () => {
     source.playbackRate.value = playbackRate;
     source.connect(gainNodeRef.current);
 
-    // Calc start times
     const startAt = ctx.currentTime;
     startTimeRef.current = startAt - (offset / playbackRate);
     
@@ -139,7 +171,6 @@ const App: React.FC = () => {
     setDuration(item.duration);
     setIsPlaying(true);
     
-    // Animation loop for UI
     const tick = () => {
         const current = (ctx.currentTime - startTimeRef.current) * playbackRate;
         if (current >= item.duration) {
@@ -153,7 +184,7 @@ const App: React.FC = () => {
     tick();
 
     source.onended = () => {
-       // handled by tick mostly, but cleanup
+       // handled by tick mostly
     };
   }, [activeId, isPlaying, playbackRate, initAudioContext, stopAudio]);
 
@@ -188,6 +219,59 @@ const App: React.FC = () => {
       }
   };
 
+  // Voice Preview Logic
+  const handlePreviewVoice = async (voiceName: string, e: React.MouseEvent) => {
+      e.stopPropagation();
+      const ctx = initAudioContext();
+      if (!ctx || !gainNodeRef.current) return;
+
+      // Stop any main audio
+      if (isPlaying) stopAudio();
+      
+      // Stop existing preview
+      if (previewSourceRef.current) {
+          try { previewSourceRef.current.stop(); } catch(e) {}
+          previewSourceRef.current = null;
+      }
+
+      if (previewVoice === voiceName) {
+          setPreviewVoice(null);
+          return;
+      }
+
+      setPreviewVoice(voiceName);
+
+      // In a real app, fetch or decode the preview
+      // For this demo, we'll generate a simple beep if no data
+      const previewBase64 = VOICE_PREVIEWS[voiceName];
+      let buffer: AudioBuffer;
+
+      try {
+        if (previewBase64) {
+             buffer = await decodeAudioData(previewBase64, ctx, SAMPLE_RATE);
+        } else {
+             // Create a dummy buffer (simple sine wave) for demo
+             buffer = ctx.createBuffer(1, SAMPLE_RATE * 1.5, SAMPLE_RATE); // 1.5s
+             const data = buffer.getChannelData(0);
+             for(let i=0; i < buffer.length; i++) {
+                 data[i] = Math.sin(i * 0.01) * 0.5 * (1 - i/buffer.length);
+             }
+             // Normally we'd fetch or use TTS to say "Hello this is [Voice]"
+             // addToast('info', `Previewing ${voiceName} (Mock Audio)`);
+        }
+
+        const source = ctx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(gainNodeRef.current);
+        source.start();
+        source.onended = () => setPreviewVoice(null);
+        previewSourceRef.current = source;
+      } catch (e) {
+          addToast('error', 'Preview failed');
+          setPreviewVoice(null);
+      }
+  };
+
   // Update volume/speed live
   useEffect(() => {
       if (gainNodeRef.current) gainNodeRef.current.gain.value = volume;
@@ -195,8 +279,6 @@ const App: React.FC = () => {
 
   useEffect(() => {
       if (sourceNodeRef.current) sourceNodeRef.current.playbackRate.value = playbackRate;
-      // If speed changes, we need to adjust startTimeRef so the playhead doesn't jump
-      // This is complex, simplest is to restart play at current time
       if (isPlaying && activeId) {
           const item = history.find(h => h.id === activeId);
           if (item) playAudio(item, currentTime);
@@ -224,10 +306,10 @@ const App: React.FC = () => {
   const handleGenerate = async () => {
     if (!text.trim()) return;
     if (text.length > MAX_CHAR_COUNT) {
-        setError(`Text too long! Limit is ${MAX_CHAR_COUNT} characters.`);
+        addToast('error', `Text too long! Limit is ${MAX_CHAR_COUNT} characters.`);
         return;
     }
-    setError(null);
+    
     setIsGenerating(true);
     const ctx = initAudioContext();
 
@@ -239,13 +321,20 @@ const App: React.FC = () => {
         mode,
         voiceName: voice,
         stylePrompt: activeStyle,
-        speakers: [speaker1, speaker2]
+        speakers: speakers
       });
 
       if (ctx) {
         const buffer = await decodeAudioData(base64Data, ctx, SAMPLE_RATE);
         
-        const voiceLabel = mode === 'single' ? voice : `Duo: ${speaker1.name} & ${speaker2.name}`;
+        let voiceLabel = voice;
+        if (mode === 'multi') {
+            if (speakers.length === 2) {
+                voiceLabel = `Duo: ${speakers[0].name} & ${speakers[1].name}`;
+            } else {
+                voiceLabel = `Cast (${speakers.length}): ${speakers.map(s => s.name).join(', ')}`;
+            }
+        }
 
         const newItem: GeneratedAudio = {
           id: Date.now().toString(),
@@ -263,9 +352,10 @@ const App: React.FC = () => {
         await db.saveItem(newItem);
         setHistory(prev => [newItem, ...prev]);
         playAudio(newItem);
+        addToast('success', 'Audio generated successfully!');
       }
     } catch (err: any) {
-      setError(err.message || 'Failed to generate speech.');
+      addToast('error', err.message || 'Failed to generate speech.');
     } finally {
       setIsGenerating(false);
     }
@@ -275,6 +365,7 @@ const App: React.FC = () => {
     if (activeId === id) stopAudio();
     await db.deleteItem(id);
     setHistory(prev => prev.filter(item => item.id !== id));
+    addToast('info', 'Item deleted');
   };
 
   const handleToggleFavorite = async (id: string) => {
@@ -301,6 +392,7 @@ const App: React.FC = () => {
     a.download = `gemini-vox-${item.id}.${format}`;
     a.click();
     URL.revokeObjectURL(url);
+    addToast('success', `Downloaded as ${format.toUpperCase()}`);
   };
 
   const handleBatchDownload = async () => {
@@ -313,9 +405,10 @@ const App: React.FC = () => {
           a.download = `gemini-vox-history-${Date.now()}.zip`;
           a.click();
           URL.revokeObjectURL(url);
+          addToast('success', 'Batch download started');
       } catch (e) {
           console.error(e);
-          setError("Failed to create zip");
+          addToast('error', "Failed to create zip");
       }
   };
 
@@ -332,6 +425,7 @@ const App: React.FC = () => {
       a.download = `gemini-vox-session.json`;
       a.click();
       URL.revokeObjectURL(url);
+      addToast('success', 'Session exported');
   };
 
   const handleImportSession = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -349,10 +443,11 @@ const App: React.FC = () => {
                        await db.saveItem({ ...item, audioBuffer: buffer } as GeneratedAudio);
                        return { ...item, audioBuffer: buffer } as GeneratedAudio;
                   }));
-                  setHistory(prev => [...hydrated, ...prev]); // Append imported
+                  setHistory(prev => [...hydrated, ...prev]);
+                  addToast('success', `Imported ${hydrated.length} items`);
               }
           } catch (e) {
-              setError("Invalid session file");
+              addToast('error', "Invalid session file");
           }
       };
       reader.readAsText(file);
@@ -365,46 +460,76 @@ const App: React.FC = () => {
           await db.clearDB();
           setHistory([]);
           setActiveId(null);
+          addToast('info', 'All history cleared');
       }
   };
 
+  // Multi-speaker Helpers
+  const addSpeaker = () => {
+      if (speakers.length >= 5) return;
+      setSpeakers([...speakers, { 
+          id: Date.now().toString(), 
+          name: `Speaker ${speakers.length + 1}`, 
+          voice: VOICES[speakers.length % VOICES.length].name,
+          color: SPEAKER_COLORS[speakers.length % SPEAKER_COLORS.length]
+      }]);
+  };
+
+  const removeSpeaker = (id: string) => {
+      if (speakers.length <= 2) return;
+      setSpeakers(speakers.filter(s => s.id !== id));
+  };
+
+  const updateSpeaker = (id: string, field: keyof SpeakerConfig, value: string) => {
+      setSpeakers(speakers.map(s => s.id === id ? { ...s, [field]: value } : s));
+  };
+
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-200 p-4 md:p-8 flex flex-col items-center">
+    <div className="min-h-screen transition-colors duration-300 bg-slate-50 dark:bg-slate-950 text-slate-800 dark:text-slate-200 p-4 md:p-8 flex flex-col items-center">
+      <ToastContainer toasts={toasts} onDismiss={dismissToast} />
+      
       <div className="max-w-6xl w-full grid grid-cols-1 lg:grid-cols-2 gap-8 mb-24">
         
         {/* LEFT COLUMN: Controls */}
         <div className="space-y-6">
           <div className="flex items-center justify-between">
             <div>
-                <h1 className="text-3xl font-bold bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent flex items-center gap-3">
-                <Sparkles className="text-indigo-400" />
+                <h1 className="text-3xl font-bold bg-gradient-to-r from-indigo-500 to-purple-500 bg-clip-text text-transparent flex items-center gap-3">
+                <Sparkles className="text-indigo-500" />
                 Gemini Vox
                 </h1>
-                <p className="text-slate-400 text-sm">
+                <p className="text-slate-500 dark:text-slate-400 text-sm">
                 Next-gen Text-to-Speech powered by Gemini 2.5 Flash
                 </p>
             </div>
             
             {/* Header Actions */}
-            <div className="flex gap-2">
-                <label className="p-2 text-slate-400 hover:text-indigo-400 cursor-pointer" title="Import Session">
+            <div className="flex gap-2 items-center">
+                <button 
+                    onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+                    className="p-2 text-slate-400 hover:text-indigo-500 dark:hover:text-indigo-400 rounded-full hover:bg-slate-200 dark:hover:bg-slate-800 transition-colors"
+                >
+                    {theme === 'dark' ? <Sun size={20} /> : <Moon size={20} />}
+                </button>
+                <div className="w-px h-6 bg-slate-300 dark:bg-slate-700 mx-1" />
+                <label className="p-2 text-slate-400 hover:text-indigo-500 dark:hover:text-indigo-400 cursor-pointer rounded-full hover:bg-slate-200 dark:hover:bg-slate-800" title="Import Session">
                     <FolderOpen size={20} />
                     <input type="file" accept=".json" onChange={handleImportSession} className="hidden" />
                 </label>
-                <button onClick={handleExportSession} className="p-2 text-slate-400 hover:text-indigo-400" title="Export Session">
+                <button onClick={handleExportSession} className="p-2 text-slate-400 hover:text-indigo-500 dark:hover:text-indigo-400 rounded-full hover:bg-slate-200 dark:hover:bg-slate-800" title="Export Session">
                     <Save size={20} />
                 </button>
             </div>
           </div>
 
-          <div className="bg-slate-900/50 rounded-2xl p-6 border border-slate-800 shadow-xl backdrop-blur-sm">
+          <div className="bg-white dark:bg-slate-900/50 rounded-2xl p-6 border border-slate-200 dark:border-slate-800 shadow-xl backdrop-blur-sm">
             
             {/* Mode Switcher */}
-            <div className="bg-slate-950 p-1 rounded-xl flex items-center mb-6 border border-slate-800">
+            <div className="bg-slate-100 dark:bg-slate-950 p-1 rounded-xl flex items-center mb-6 border border-slate-200 dark:border-slate-800">
                 <button 
                   onClick={() => setMode('single')}
                   className={`flex-1 py-2 rounded-lg text-sm font-medium transition-all flex items-center justify-center gap-2 ${
-                    mode === 'single' ? 'bg-slate-800 text-white shadow-sm' : 'text-slate-500 hover:text-slate-300'
+                    mode === 'single' ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-sm' : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'
                   }`}
                 >
                     <User size={16} /> Solo
@@ -412,7 +537,7 @@ const App: React.FC = () => {
                 <button 
                   onClick={() => setMode('multi')}
                   className={`flex-1 py-2 rounded-lg text-sm font-medium transition-all flex items-center justify-center gap-2 ${
-                    mode === 'multi' ? 'bg-slate-800 text-white shadow-sm' : 'text-slate-500 hover:text-slate-300'
+                    mode === 'multi' ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-sm' : 'text-slate-500 hover:text-slate-700 dark:hover:text-slate-300'
                   }`}
                 >
                     <Users size={16} /> Conversation
@@ -423,33 +548,46 @@ const App: React.FC = () => {
                 <>
                     {/* Solo Voice Selection */}
                     <div className="mb-6">
-                    <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">
+                    <label className="block text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-3">
                         Select Voice
                     </label>
                     <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
                         {VOICES.map((v) => (
-                        <button
+                        <div
                             key={v.name}
-                            onClick={() => setVoice(v.name)}
-                            className={`relative p-3 rounded-xl border text-left transition-all ${
+                            className={`group relative p-3 rounded-xl border text-left transition-all cursor-pointer ${
                             voice === v.name
-                                ? 'bg-indigo-500/10 border-indigo-500 text-indigo-300 shadow-[0_0_15px_rgba(99,102,241,0.2)]'
-                                : 'bg-slate-800 border-slate-700 text-slate-400 hover:border-slate-600 hover:bg-slate-800/80'
+                                ? 'bg-indigo-50 dark:bg-indigo-500/10 border-indigo-500 text-indigo-700 dark:text-indigo-300 shadow-md'
+                                : 'bg-slate-50 dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-500 dark:text-slate-400 hover:border-slate-300 dark:hover:border-slate-600'
                             }`}
+                            onClick={() => setVoice(v.name)}
                         >
                             <div className="font-medium text-sm flex items-center justify-between">
-                            {v.label}
-                            {voice === v.name && <div className="w-2 h-2 rounded-full bg-indigo-500 animate-pulse" />}
+                                {v.label}
+                                {voice === v.name && <div className="w-2 h-2 rounded-full bg-indigo-500 animate-pulse" />}
                             </div>
                             <div className="text-[10px] opacity-70 mt-1">{v.gender} • {v.description}</div>
-                        </button>
+                            
+                            {/* Preview Button */}
+                            <button
+                                onClick={(e) => handlePreviewVoice(v.name, e)}
+                                className={`absolute top-2 right-2 p-1.5 rounded-full transition-all ${
+                                    previewVoice === v.name 
+                                    ? 'bg-indigo-500 text-white animate-pulse' 
+                                    : 'bg-slate-200 dark:bg-slate-700 text-slate-500 dark:text-slate-400 hover:bg-indigo-100 dark:hover:bg-indigo-900 hover:text-indigo-500 opacity-0 group-hover:opacity-100'
+                                }`}
+                                title="Preview Voice"
+                            >
+                                <Volume2 size={12} />
+                            </button>
+                        </div>
                         ))}
                     </div>
                     </div>
 
                     {/* Style Selection */}
                     <div className="mb-6">
-                    <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">
+                    <label className="block text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider mb-3">
                         Expression Style
                     </label>
                     <div className="flex flex-wrap gap-2 mb-3">
@@ -460,7 +598,7 @@ const App: React.FC = () => {
                             className={`px-3 py-1.5 rounded-full text-xs font-medium border transition-colors ${
                             stylePrompt === style
                                 ? 'bg-purple-500 text-white border-purple-500'
-                                : 'bg-slate-800 border-slate-700 text-slate-400 hover:border-slate-500'
+                                : 'bg-slate-100 dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-400 hover:border-slate-400 dark:hover:border-slate-500'
                             }`}
                         >
                             {style}
@@ -471,7 +609,7 @@ const App: React.FC = () => {
                             className={`px-3 py-1.5 rounded-full text-xs font-medium border transition-colors flex items-center gap-1 ${
                             stylePrompt === 'Custom'
                                 ? 'bg-purple-500 text-white border-purple-500'
-                                : 'bg-slate-800 border-slate-700 text-slate-400 hover:border-slate-500'
+                                : 'bg-slate-100 dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-400 hover:border-slate-400 dark:hover:border-slate-500'
                             }`}
                         >
                             <Wand2 size={12} /> Custom
@@ -484,64 +622,66 @@ const App: React.FC = () => {
                         value={customStyle}
                         onChange={(e) => setCustomStyle(e.target.value)}
                         placeholder="e.g. Like a pirate, whispering in a library..."
-                        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-4 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-purple-500/50"
+                        className="w-full bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-700 rounded-lg px-4 py-2 text-sm text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-purple-500/50"
                         />
                     )}
                     </div>
                 </>
             ) : (
-                /* Multi Speaker Setup */
+                /* Multi Speaker Setup (3+) */
                 <div className="mb-6 space-y-4">
                     <div className="flex items-center justify-between">
-                        <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                            Cast Configuration (2 Speakers)
+                        <label className="block text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider">
+                            Cast Configuration ({speakers.length})
                         </label>
+                        <button 
+                            onClick={addSpeaker}
+                            disabled={speakers.length >= 5}
+                            className="text-xs flex items-center gap-1 text-indigo-500 hover:text-indigo-600 disabled:opacity-50"
+                        >
+                            <Plus size={14} /> Add Speaker
+                        </button>
                     </div>
                     
-                    <div className="grid grid-cols-2 gap-4">
-                        {/* Speaker 1 */}
-                        <div className="p-3 bg-slate-800/50 rounded-xl border border-slate-700/50">
-                            <div className="flex items-center gap-2 mb-2">
-                                <div className="w-5 h-5 rounded-full bg-indigo-500 flex items-center justify-center text-[10px] font-bold">1</div>
-                                <span className="text-xs font-medium text-indigo-200">First Speaker</span>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-h-[300px] overflow-y-auto pr-1 custom-scrollbar">
+                        {speakers.map((speaker, idx) => (
+                            <div key={speaker.id} className="p-3 bg-slate-50 dark:bg-slate-800/50 rounded-xl border border-slate-200 dark:border-slate-700/50 relative group">
+                                <div className="flex items-center gap-2 mb-2">
+                                     <div 
+                                        className="w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold text-white"
+                                        style={{ backgroundColor: speaker.color }}
+                                     >
+                                         {idx + 1}
+                                     </div>
+                                     <span className="text-xs font-medium text-slate-700 dark:text-slate-200">Speaker {idx + 1}</span>
+                                     
+                                     {speakers.length > 2 && (
+                                         <button 
+                                            onClick={() => removeSpeaker(speaker.id)}
+                                            className="ml-auto text-slate-400 hover:text-red-500"
+                                         >
+                                             <Minus size={14} />
+                                         </button>
+                                     )}
+                                </div>
+                                <div className="space-y-2">
+                                    <input 
+                                        type="text" 
+                                        value={speaker.name} 
+                                        onChange={(e) => updateSpeaker(speaker.id, 'name', e.target.value)}
+                                        className="w-full bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg px-2 py-1.5 text-xs text-slate-800 dark:text-slate-200 focus:ring-1 focus:ring-indigo-500"
+                                        placeholder="Name"
+                                    />
+                                    <select 
+                                        value={speaker.voice}
+                                        onChange={(e) => updateSpeaker(speaker.id, 'voice', e.target.value)}
+                                        className="w-full bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg px-2 py-1.5 text-xs text-slate-800 dark:text-slate-200 focus:ring-1 focus:ring-indigo-500"
+                                    >
+                                        {VOICES.map(v => <option key={v.name} value={v.name}>{v.label}</option>)}
+                                    </select>
+                                </div>
                             </div>
-                            <input 
-                                type="text" 
-                                value={speaker1.name} 
-                                onChange={(e) => setSpeaker1({...speaker1, name: e.target.value})}
-                                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-slate-200 mb-2 focus:ring-1 focus:ring-indigo-500"
-                                placeholder="Name"
-                            />
-                            <select 
-                                value={speaker1.voice}
-                                onChange={(e) => setSpeaker1({...speaker1, voice: e.target.value})}
-                                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-slate-200 focus:ring-1 focus:ring-indigo-500"
-                            >
-                                {VOICES.map(v => <option key={v.name} value={v.name}>{v.label}</option>)}
-                            </select>
-                        </div>
-
-                        {/* Speaker 2 */}
-                        <div className="p-3 bg-slate-800/50 rounded-xl border border-slate-700/50">
-                            <div className="flex items-center gap-2 mb-2">
-                                <div className="w-5 h-5 rounded-full bg-purple-500 flex items-center justify-center text-[10px] font-bold">2</div>
-                                <span className="text-xs font-medium text-purple-200">Second Speaker</span>
-                            </div>
-                            <input 
-                                type="text" 
-                                value={speaker2.name} 
-                                onChange={(e) => setSpeaker2({...speaker2, name: e.target.value})}
-                                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-slate-200 mb-2 focus:ring-1 focus:ring-purple-500"
-                                placeholder="Name"
-                            />
-                            <select 
-                                value={speaker2.voice}
-                                onChange={(e) => setSpeaker2({...speaker2, voice: e.target.value})}
-                                className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-slate-200 focus:ring-1 focus:ring-purple-500"
-                            >
-                                {VOICES.map(v => <option key={v.name} value={v.name}>{v.label}</option>)}
-                            </select>
-                        </div>
+                        ))}
                     </div>
                 </div>
             )}
@@ -549,18 +689,18 @@ const App: React.FC = () => {
             {/* Text Input */}
             <div className="mb-6 relative">
               <div className="flex justify-between items-center mb-3">
-                  <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider">
+                  <label className="block text-xs font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider">
                     Script
                   </label>
-                  <span className={`text-[10px] ${text.length > MAX_CHAR_COUNT ? 'text-red-400' : 'text-slate-500'}`}>
+                  <span className={`text-[10px] ${text.length > MAX_CHAR_COUNT ? 'text-red-500' : 'text-slate-500'}`}>
                       {text.length} / {MAX_CHAR_COUNT}
                   </span>
               </div>
               <textarea
                 value={text}
                 onChange={(e) => setText(e.target.value)}
-                placeholder={mode === 'single' ? "Type something..." : "Name: Message..."}
-                className="w-full h-40 bg-slate-950 border border-slate-700 rounded-xl p-4 text-slate-200 placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 resize-none leading-relaxed text-sm font-mono"
+                placeholder={mode === 'single' ? "Type something..." : "Joe: Hello!\nJane: Hi there."}
+                className="w-full h-40 bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-700 rounded-xl p-4 text-slate-800 dark:text-slate-200 placeholder-slate-400 dark:placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 resize-none leading-relaxed text-sm font-mono"
               />
             </div>
 
@@ -570,7 +710,7 @@ const App: React.FC = () => {
               disabled={isGenerating || !text.trim() || text.length > MAX_CHAR_COUNT}
               className={`w-full py-4 rounded-xl font-bold flex items-center justify-center gap-2 transition-all shadow-lg ${
                 isGenerating || !text.trim() || text.length > MAX_CHAR_COUNT
-                  ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                  ? 'bg-slate-200 dark:bg-slate-800 text-slate-400 dark:text-slate-500 cursor-not-allowed'
                   : 'bg-gradient-to-r from-indigo-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white shadow-indigo-500/20 active:scale-[0.98]'
               }`}
             >
@@ -584,26 +724,38 @@ const App: React.FC = () => {
                 </>
               )}
             </button>
-            
-            {error && (
-              <div className="mt-4 p-3 bg-red-500/10 border border-red-500/20 rounded-lg text-red-400 text-sm text-center">
-                {error}
-              </div>
-            )}
           </div>
         </div>
 
         {/* RIGHT COLUMN: Output & History */}
         <div className="space-y-6 flex flex-col h-full">
           {/* Main Visualizer Panel */}
-          <div className="bg-slate-900 rounded-2xl border border-slate-800 shadow-xl relative overflow-hidden flex flex-col">
-             <div className="h-[200px] relative flex items-center justify-center bg-slate-950/50">
+          <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-xl relative overflow-hidden flex flex-col">
+             <div className="h-[200px] relative flex items-center justify-center bg-slate-50 dark:bg-slate-950/50">
                 {/* Visualizer BG */}
                 <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500" />
                 
+                {/* Visualizer Mode Toggle */}
+                <div className="absolute top-4 right-4 z-20 bg-white/10 backdrop-blur-md rounded-lg p-1 flex gap-1 border border-white/20">
+                     <button 
+                        onClick={() => setVizMode('spectrum')}
+                        className={`p-1.5 rounded-md transition-all ${vizMode === 'spectrum' ? 'bg-indigo-500 text-white shadow-sm' : 'text-slate-400 hover:text-slate-200'}`}
+                        title="Spectrum View"
+                     >
+                         <BarChart3 size={14} />
+                     </button>
+                     <button 
+                        onClick={() => setVizMode('waveform')}
+                        className={`p-1.5 rounded-md transition-all ${vizMode === 'waveform' ? 'bg-indigo-500 text-white shadow-sm' : 'text-slate-400 hover:text-slate-200'}`}
+                        title="Waveform View"
+                     >
+                         <Activity size={14} />
+                     </button>
+                </div>
+
                 {activeId ? (
                    <div className="w-full h-full p-6 flex flex-col justify-end">
-                      <div className="mb-auto flex items-center gap-2 text-indigo-400">
+                      <div className="mb-auto flex items-center gap-2 text-indigo-500 dark:text-indigo-400">
                            {isPlaying ? <Music4 className="animate-pulse" size={16} /> : <Volume2 size={16}/>}
                            <span className="text-xs font-bold tracking-widest uppercase">Now Playing</span>
                       </div>
@@ -611,12 +763,13 @@ const App: React.FC = () => {
                           analyser={analyserRef.current} 
                           isPlaying={isPlaying} 
                           color="#818cf8"
+                          mode={vizMode}
                        />
                    </div>
                 ) : (
-                    <div className="text-center text-slate-600 flex flex-col items-center p-6">
-                        <div className="w-16 h-16 rounded-full bg-slate-800 flex items-center justify-center mb-4">
-                            <Volume2 size={24} className="text-slate-500" />
+                    <div className="text-center text-slate-400 dark:text-slate-600 flex flex-col items-center p-6">
+                        <div className="w-16 h-16 rounded-full bg-slate-100 dark:bg-slate-800 flex items-center justify-center mb-4">
+                            <Volume2 size={24} className="text-slate-300 dark:text-slate-500" />
                         </div>
                         <p className="text-sm font-medium">Ready to speak</p>
                     </div>
@@ -638,23 +791,23 @@ const App: React.FC = () => {
           </div>
 
           {/* History List */}
-          <div className="flex-1 bg-slate-900/50 rounded-2xl border border-slate-800 shadow-xl flex flex-col overflow-hidden min-h-[400px]">
-            <div className="p-4 border-b border-slate-800 bg-slate-900/80 backdrop-blur-sm sticky top-0 z-10 flex justify-between items-center">
-              <h3 className="font-semibold text-slate-300 flex items-center gap-2">
+          <div className="flex-1 bg-white dark:bg-slate-900/50 rounded-2xl border border-slate-200 dark:border-slate-800 shadow-xl flex flex-col overflow-hidden min-h-[400px]">
+            <div className="p-4 border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/80 backdrop-blur-sm sticky top-0 z-10 flex justify-between items-center">
+              <h3 className="font-semibold text-slate-700 dark:text-slate-300 flex items-center gap-2">
                 <span className="w-2 h-2 rounded-full bg-green-500" />
                 History ({history.length})
               </h3>
               <div className="flex gap-2">
                   <button 
                     onClick={handleBatchDownload} 
-                    className="p-1.5 text-slate-400 hover:text-indigo-400 rounded-lg hover:bg-slate-800 transition-colors"
+                    className="p-1.5 text-slate-400 hover:text-indigo-500 dark:hover:text-indigo-400 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
                     title="Download All as ZIP"
                   >
                       <Archive size={18} />
                   </button>
                   <button 
                     onClick={handleClearAll} 
-                    className="p-1.5 text-slate-400 hover:text-red-400 rounded-lg hover:bg-slate-800 transition-colors"
+                    className="p-1.5 text-slate-400 hover:text-red-500 dark:hover:text-red-400 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
                     title="Clear All"
                   >
                       <Trash2 size={18} />
@@ -662,9 +815,9 @@ const App: React.FC = () => {
               </div>
             </div>
             
-            <div className="flex-1 overflow-y-auto p-4 space-y-3">
+            <div className="flex-1 overflow-y-auto p-4 space-y-3 custom-scrollbar">
               {history.length === 0 ? (
-                <div className="h-full flex flex-col items-center justify-center text-slate-600 opacity-60">
+                <div className="h-full flex flex-col items-center justify-center text-slate-400 dark:text-slate-600 opacity-60">
                   <p className="text-sm">No generations yet.</p>
                 </div>
               ) : (
