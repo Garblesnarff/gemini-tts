@@ -1,4 +1,4 @@
-import { GoogleGenAI, Modality } from "@google/genai";
+import { GoogleGenAI } from "@google/genai";
 import { TTSRequest } from "../types";
 
 // Initialize the client
@@ -8,8 +8,9 @@ const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
 export const generateSpeech = async (request: TTSRequest): Promise<string> => {
   const { text, mode, voiceName, stylePrompt, speakers } = request;
 
+  // Use string 'AUDIO' instead of Modality.AUDIO to ensure compatibility across build environments
   let config: any = {
-    responseModalities: [Modality.AUDIO],
+    responseModalities: ['AUDIO'],
   };
 
   let contentsPayload: any[] = [];
@@ -58,10 +59,18 @@ export const generateSpeech = async (request: TTSRequest): Promise<string> => {
     if (audioPart && audioPart.inlineData && audioPart.inlineData.data) {
       return audioPart.inlineData.data;
     } else {
-      throw new Error("No audio data returned from the model.");
+      // Check for safety blocks or other finish reasons
+      if (candidate?.finishReason && candidate.finishReason !== 'STOP') {
+        throw new Error(`Generation stopped. Reason: ${candidate.finishReason}`);
+      }
+      throw new Error("No audio data returned from the model. Please check your API key and quota.");
     }
-  } catch (error) {
+  } catch (error: any) {
     console.error("Gemini TTS Error:", error);
+    // Enhance error message if it's an API Key issue
+    if (error.message?.includes('API key')) {
+        throw new Error("Invalid or missing API Key.");
+    }
     throw error;
   }
 };
