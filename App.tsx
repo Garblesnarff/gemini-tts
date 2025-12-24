@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Mic, Volume2, Sparkles, Wand2, Loader2, Music4, Users, User, Trash2, Archive, Save, FolderOpen, Upload, Sun, Moon, Plus, Minus, BarChart3, Activity } from 'lucide-react';
+import { Mic, Volume2, Sparkles, Wand2, Loader2, Music4, Users, User, Trash2, Archive, Save, FolderOpen, Upload, Sun, Moon, Plus, Minus, BarChart3, Activity, BookTemplate } from 'lucide-react';
 import { VOICES, STYLE_PRESETS, SAMPLE_RATE, SPEAKER_COLORS, VOICE_PREVIEWS } from './constants';
-import { GeneratedAudio, SpeakerConfig, SessionData, ToastMessage } from './types';
+import { GeneratedAudio, SpeakerConfig, SessionData, ToastMessage, VoiceProfile } from './types';
 import { generateSpeech } from './services/geminiService';
 import { decodeAudioData, audioBufferToWav, audioBufferToMp3, createBatchZip } from './utils/audioUtils';
 import * as db from './utils/db';
@@ -9,6 +9,7 @@ import Visualizer from './components/Visualizer';
 import { HistoryItem } from './components/HistoryItem';
 import PlayerControls from './components/PlayerControls';
 import ToastContainer from './components/Toast';
+import ProfileModal from './components/ProfileModal';
 
 const MAX_CHAR_COUNT = 5000;
 
@@ -27,6 +28,9 @@ const App: React.FC = () => {
     setToasts(prev => [...prev, { id: Date.now().toString(), type, message }]);
   };
   const dismissToast = (id: string) => setToasts(prev => prev.filter(t => t.id !== id));
+
+  // Modal State
+  const [isProfileModalOpen, setIsProfileModalOpen] = useState(false);
 
   // Mode State
   const [mode, setMode] = useState<'single' | 'multi'>('single');
@@ -225,10 +229,8 @@ const App: React.FC = () => {
       const ctx = initAudioContext();
       if (!ctx || !gainNodeRef.current) return;
 
-      // Stop any main audio
       if (isPlaying) stopAudio();
       
-      // Stop existing preview
       if (previewSourceRef.current) {
           try { previewSourceRef.current.stop(); } catch(e) {}
           previewSourceRef.current = null;
@@ -241,8 +243,6 @@ const App: React.FC = () => {
 
       setPreviewVoice(voiceName);
 
-      // In a real app, fetch or decode the preview
-      // For this demo, we'll generate a simple beep if no data
       const previewBase64 = VOICE_PREVIEWS[voiceName];
       let buffer: AudioBuffer;
 
@@ -250,14 +250,11 @@ const App: React.FC = () => {
         if (previewBase64) {
              buffer = await decodeAudioData(previewBase64, ctx, SAMPLE_RATE);
         } else {
-             // Create a dummy buffer (simple sine wave) for demo
-             buffer = ctx.createBuffer(1, SAMPLE_RATE * 1.5, SAMPLE_RATE); // 1.5s
+             buffer = ctx.createBuffer(1, SAMPLE_RATE * 1.5, SAMPLE_RATE); 
              const data = buffer.getChannelData(0);
              for(let i=0; i < buffer.length; i++) {
                  data[i] = Math.sin(i * 0.01) * 0.5 * (1 - i/buffer.length);
              }
-             // Normally we'd fetch or use TTS to say "Hello this is [Voice]"
-             // addToast('info', `Previewing ${voiceName} (Mock Audio)`);
         }
 
         const source = ctx.createBufferSource();
@@ -483,10 +480,30 @@ const App: React.FC = () => {
   const updateSpeaker = (id: string, field: keyof SpeakerConfig, value: string) => {
       setSpeakers(speakers.map(s => s.id === id ? { ...s, [field]: value } : s));
   };
+  
+  // Profile loading
+  const handleLoadProfile = (p: VoiceProfile) => {
+      setMode('single'); // Profiles are typically single speaker config in this iteration
+      setVoice(p.voice);
+      if (p.customStyle) {
+          setStylePrompt('Custom');
+          setCustomStyle(p.customStyle);
+      } else {
+          setStylePrompt(p.style);
+      }
+      addToast('success', `Loaded profile: ${p.name}`);
+  };
 
   return (
     <div className="min-h-screen transition-colors duration-300 bg-slate-50 dark:bg-slate-950 text-slate-800 dark:text-slate-200 p-4 md:p-8 flex flex-col items-center">
       <ToastContainer toasts={toasts} onDismiss={dismissToast} />
+      <ProfileModal 
+         isOpen={isProfileModalOpen} 
+         onClose={() => setIsProfileModalOpen(false)}
+         onLoadProfile={handleLoadProfile}
+         currentSettings={{ voice, style: stylePrompt, customStyle }}
+         addToast={addToast}
+      />
       
       <div className="max-w-6xl w-full grid grid-cols-1 lg:grid-cols-2 gap-8 mb-24">
         
@@ -506,12 +523,19 @@ const App: React.FC = () => {
             {/* Header Actions */}
             <div className="flex gap-2 items-center">
                 <button 
+                    onClick={() => setIsProfileModalOpen(true)}
+                    className="p-2 text-slate-400 hover:text-indigo-500 dark:hover:text-indigo-400 rounded-full hover:bg-slate-200 dark:hover:bg-slate-800 transition-colors"
+                    title="Manage Profiles"
+                >
+                    <BookTemplate size={20} />
+                </button>
+                <div className="w-px h-6 bg-slate-300 dark:bg-slate-700 mx-1" />
+                <button 
                     onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
                     className="p-2 text-slate-400 hover:text-indigo-500 dark:hover:text-indigo-400 rounded-full hover:bg-slate-200 dark:hover:bg-slate-800 transition-colors"
                 >
                     {theme === 'dark' ? <Sun size={20} /> : <Moon size={20} />}
                 </button>
-                <div className="w-px h-6 bg-slate-300 dark:bg-slate-700 mx-1" />
                 <label className="p-2 text-slate-400 hover:text-indigo-500 dark:hover:text-indigo-400 cursor-pointer rounded-full hover:bg-slate-200 dark:hover:bg-slate-800" title="Import Session">
                     <FolderOpen size={20} />
                     <input type="file" accept=".json" onChange={handleImportSession} className="hidden" />

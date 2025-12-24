@@ -44,3 +44,13 @@ export interface ToastMessage {
   type: 'success' | 'error' | 'info';
   message: string;
 }
+
+export interface VoiceProfile {
+  id: string;
+  name: string;
+  voice: string;
+  style: string;
+  customStyle?: string;
+  description?: string;
+  createdAt: number;
+}
